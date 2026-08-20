@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "27790730882",
+    "project_id": "vigilai-f70e2",
+    "storage_bucket": "vigilai-f70e2.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:27790730882:android:bd91eef7cc46069a0e769b",
+        "android_client_info": {
+          "package_name": "com.example.vigil_drive"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBZhTe2RFZH1VFingNh-oSpSSJvM8k3sVw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
