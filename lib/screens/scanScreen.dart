@@ -20,7 +20,7 @@ class SafetyScanScreen extends StatefulWidget {
 class _SafetyScanScreenState extends State<SafetyScanScreen>
     with WidgetsBindingObserver {
   // ============================================================
-  // API CONFIGURATION
+  // API
   // ============================================================
 
   static const String fastApiUrl =
@@ -32,10 +32,15 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   String? accessToken;
 
   // ============================================================
-  // SCAN CONFIGURATION
+  // SCAN CONFIG
   // ============================================================
 
   static const int scanDurationSeconds = 5;
+
+  // Give Android MediaRecorder a little time to finalize
+  // the MP4 container after stopVideoRecording().
+  static const Duration videoFinalizeDelay =
+  Duration(milliseconds: 800);
 
   // ============================================================
   // CAMERA
@@ -47,7 +52,12 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   bool _isRecording = false;
   bool _isProcessing = false;
   bool _scanFinished = false;
-  bool _cameraInitializing = false;
+
+  // Prevent multiple camera initialization calls.
+  bool _isInitializingCamera = false;
+
+  // Prevent the scan from being started twice.
+  bool _scanStarted = false;
 
   Timer? _scanTimer;
   Timer? _countdownTimer;
@@ -55,7 +65,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   int _remainingSeconds = scanDurationSeconds;
 
   // ============================================================
-  // LOCAL VIDEO STORAGE
+  // LOCAL VIDEO
   // ============================================================
 
   String? _localVideoPath;
@@ -71,6 +81,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   _gyroscopeSubscription;
 
   final List<Map<String, dynamic>> _accelerometerData = [];
+
   final List<Map<String, dynamic>> _gyroscopeData = [];
 
   // ============================================================
@@ -78,12 +89,15 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   // ============================================================
 
   int _suddenBrakingEvents = 0;
+
   int _swervingEvents = 0;
 
   DateTime? _lastBrakingEvent;
+
   DateTime? _lastSwervingEvent;
 
   static const double brakingThreshold = 6.0;
+
   static const double swervingThreshold = 5.0;
 
   static const Duration motionEventCooldown =
@@ -115,10 +129,13 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
     _scanTimer?.cancel();
     _countdownTimer?.cancel();
 
-    _accelerometerSubscription?.cancel();
-    _gyroscopeSubscription?.cancel();
+    _stopSensorMonitoring();
 
-    _cameraController?.dispose();
+    final controller = _cameraController;
+
+    _cameraController = null;
+
+    controller?.dispose();
 
     super.dispose();
   }
@@ -127,24 +144,30 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   void didChangeAppLifecycleState(
       AppLifecycleState state,
       ) {
-    final controller = _cameraController;
+    debugPrint(
+      'App lifecycle changed: $state',
+    );
 
-    if (state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.paused) {
-      // Never dispose the camera while recording.
-      if (!_isRecording &&
-          controller != null) {
-        _disposeCamera();
-      }
+    // ----------------------------------------------------------
+    // IMPORTANT:
+    //
+    // NEVER dispose/reinitialize the camera while recording.
+    // This was one of the causes of the scan getting stuck.
+    // ----------------------------------------------------------
 
+    if (_isRecording || _isProcessing) {
       return;
     }
 
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      _disposeCamera();
+    }
+
     if (state == AppLifecycleState.resumed) {
-      if (!_isRecording &&
-          !_isProcessing &&
-          !_scanFinished &&
-          !_cameraReady) {
+      if (!_scanFinished &&
+          !_scanStarted &&
+          !_isProcessing) {
         _initializeCamera();
       }
     }
@@ -181,37 +204,49 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   // ============================================================
 
   Future<void> _initializeCamera() async {
-    if (_cameraInitializing ||
-        _isRecording ||
-        _isProcessing) {
+    if (_isInitializingCamera) {
+      debugPrint(
+        'Camera initialization already running.',
+      );
+
       return;
     }
 
-    _cameraInitializing = true;
+    if (_isRecording ||
+        _isProcessing ||
+        _scanFinished ||
+        _scanStarted) {
+      debugPrint(
+        'Camera initialization skipped.',
+      );
+
+      return;
+    }
+
+    _isInitializingCamera = true;
 
     try {
+      debugPrint(
+        'Initializing camera...',
+      );
+
       await _disposeCamera();
 
       final cameras = await availableCameras();
 
       if (cameras.isEmpty) {
-        debugPrint(
+        throw Exception(
           'No cameras available.',
         );
-
-        if (mounted) {
-          _showError(
-            'No camera was found on this device.',
-          );
-        }
-
-        return;
       }
+
+      // --------------------------------------------------------
+      // Prefer front camera for driver monitoring.
+      // --------------------------------------------------------
 
       CameraDescription selectedCamera =
           cameras.first;
 
-      // Prefer front camera for driver monitoring.
       for (final camera in cameras) {
         if (camera.lensDirection ==
             CameraLensDirection.front) {
@@ -221,8 +256,16 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       }
 
       debugPrint(
-        'Selected camera: ${selectedCamera.name}',
+        'Selected camera: '
+            '${selectedCamera.name}',
       );
+
+      // --------------------------------------------------------
+      // MEDIUM is deliberately used.
+      //
+      // Higher resolutions produce much larger MP4 files and
+      // increase the chance of upload/reset problems on Render.
+      // --------------------------------------------------------
 
       final controller = CameraController(
         selectedCamera,
@@ -236,6 +279,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
 
       if (!mounted) {
         await controller.dispose();
+
         return;
       }
 
@@ -247,9 +291,12 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         'Camera initialized successfully.',
       );
 
-      // Start scan automatically.
-      if (!_scanFinished &&
-          !_isRecording &&
+      // --------------------------------------------------------
+      // Start only ONCE.
+      // --------------------------------------------------------
+
+      if (!_scanStarted &&
+          !_scanFinished &&
           !_isProcessing) {
         await _startSafetyScan();
       }
@@ -259,7 +306,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
             '${e.code} - ${e.description}',
       );
 
-      _cameraController = null;
+      _cameraReady = false;
 
       if (mounted) {
         setState(() {
@@ -276,8 +323,6 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         'Camera initialization error: $e',
       );
 
-      _cameraController = null;
-
       if (mounted) {
         setState(() {
           _cameraReady = false;
@@ -288,32 +333,54 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         );
       }
     } finally {
-      _cameraInitializing = false;
+      _isInitializingCamera = false;
     }
   }
 
   // ============================================================
-  // START 5 SECOND SCAN
+  // START SAFETY SCAN
   // ============================================================
 
   Future<void> _startSafetyScan() async {
     final controller = _cameraController;
 
-    if (controller == null ||
-        !controller.value.isInitialized ||
-        _isRecording ||
-        _isProcessing) {
+    if (controller == null) {
+      debugPrint(
+        'Cannot start scan: camera controller is null.',
+      );
+
+      return;
+    }
+
+    if (!controller.value.isInitialized) {
+      debugPrint(
+        'Cannot start scan: camera not initialized.',
+      );
+
+      return;
+    }
+
+    if (_isRecording ||
+        _isProcessing ||
+        _scanStarted ||
+        _scanFinished) {
       return;
     }
 
     try {
+      _scanStarted = true;
+
       _resetScanData();
 
       _startSensorMonitoring();
 
       debugPrint(
-        'Starting $scanDurationSeconds second safety recording...',
+        'Starting $scanDurationSeconds second safety scan...',
       );
+
+      // --------------------------------------------------------
+      // START RECORDING
+      // --------------------------------------------------------
 
       await controller.startVideoRecording();
 
@@ -323,13 +390,14 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
 
       setState(() {
         _isRecording = true;
+
         _remainingSeconds =
             scanDurationSeconds;
       });
 
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
       // COUNTDOWN
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
 
       _countdownTimer?.cancel();
 
@@ -338,6 +406,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
             (timer) {
           if (!mounted) {
             timer.cancel();
+
             return;
           }
 
@@ -353,16 +422,14 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         },
       );
 
-      // ----------------------------------------------------------
-      // ACTUAL RECORDING TIMER
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
+      // EXACTLY 5 SECONDS
+      // --------------------------------------------------------
 
       _scanTimer?.cancel();
 
       _scanTimer = Timer(
-        const Duration(
-          seconds: scanDurationSeconds,
-        ),
+        const Duration(seconds: scanDurationSeconds),
         _finishSafetyScan,
       );
     } on CameraException catch (e) {
@@ -370,6 +437,8 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         'Could not start recording: '
             '${e.code} - ${e.description}',
       );
+
+      _scanStarted = false;
 
       _stopSensorMonitoring();
 
@@ -387,6 +456,8 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         'Could not start recording: $e',
       );
 
+      _scanStarted = false;
+
       _stopSensorMonitoring();
 
       if (mounted) {
@@ -402,27 +473,50 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   }
 
   // ============================================================
-  // FINISH 5 SECOND SCAN
+  // FINISH SAFETY SCAN
   // ============================================================
 
   Future<void> _finishSafetyScan() async {
     if (!_isRecording ||
+        _isProcessing ||
         _scanFinished) {
       return;
     }
 
+    debugPrint(
+      'Finishing safety scan...',
+    );
+
     _scanTimer?.cancel();
     _countdownTimer?.cancel();
 
+    _scanTimer = null;
+    _countdownTimer = null;
+
+    // Stop sensors BEFORE processing the video.
     _stopSensorMonitoring();
 
     final controller = _cameraController;
 
-    if (controller == null ||
-        !controller.value.isInitialized ||
-        !controller.value.isRecordingVideo) {
+    if (controller == null) {
       debugPrint(
-        'Camera is not recording when scan finished.',
+        'Cannot finish scan: camera controller is null.',
+      );
+
+      return;
+    }
+
+    if (!controller.value.isInitialized) {
+      debugPrint(
+        'Cannot finish scan: camera is not initialized.',
+      );
+
+      return;
+    }
+
+    if (!controller.value.isRecordingVideo) {
+      debugPrint(
+        'Camera is no longer recording.',
       );
 
       return;
@@ -442,22 +536,43 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       // ========================================================
 
       debugPrint(
-        'Stopping camera recording...',
+        'Stopping video recording...',
       );
 
       final XFile recordedFile =
       await controller.stopVideoRecording();
 
       debugPrint(
-        'Camera recording stopped.',
+        'Camera returned file: '
+            '${recordedFile.path}',
       );
 
       // ========================================================
       // STEP 2
-      // STORE VIDEO LOCALLY
+      // IMPORTANT ANDROID FIX
+      //
+      // Give MediaRecorder time to finalize the MP4 metadata.
+      //
+      // This helps with:
+      //
+      // getMetaData returned -22
+      //
       // ========================================================
 
-      final String localPath =
+      debugPrint(
+        'Waiting for Android to finalize MP4...',
+      );
+
+      await Future.delayed(
+        videoFinalizeDelay,
+      );
+
+      // ========================================================
+      // STEP 3
+      // SAVE LOCALLY
+      // ========================================================
+
+      final localPath =
       await _storeVideoLocally(
         recordedFile,
       );
@@ -465,36 +580,56 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       _localVideoPath = localPath;
 
       debugPrint(
-        'Video stored locally at:',
+        'Local video ready: $localPath',
       );
 
-      debugPrint(localPath);
+      // ========================================================
+      // STEP 4
+      // VERIFY VIDEO
+      // ========================================================
+
+      final bool validVideo =
+      await _verifyLocalVideo(
+        localPath,
+      );
+
+      if (!validVideo) {
+        throw Exception(
+          'Recorded video file is invalid or empty.',
+        );
+      }
 
       // ========================================================
-      // STEP 3
-      // UPLOAD LOCAL VIDEO TO FASTAPI
+      // STEP 5
+      // CAMERA IS NO LONGER NEEDED
+      //
+      // Dispose it completely.
+      //
+      // DO NOT call _initializeCamera() afterwards.
+      // ========================================================
+
+      await _disposeCamera();
+
+      // ========================================================
+      // STEP 6
+      // UPLOAD TO FASTAPI
       // ========================================================
 
       debugPrint(
         'Uploading local video to FastAPI...',
       );
 
-      final Map<String, dynamic>?
-      fastApiResult =
+      final fastApiResult =
       await _sendLocalVideoToFastAPI(
         localPath,
       );
-
-      // ========================================================
-      // FASTAPI FAILED
-      // ========================================================
 
       if (fastApiResult == null) {
         debugPrint(
           'FastAPI processing failed.',
         );
 
-        // Keep local video so it can be retried.
+        // Keep local file for retry.
 
         if (mounted) {
           setState(() {
@@ -503,7 +638,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
 
           _showError(
             'Safety analysis failed.\n'
-                'The recorded scan has been kept locally.',
+                'The recorded scan was kept locally.',
           );
         }
 
@@ -517,17 +652,16 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       );
 
       // ========================================================
-      // STEP 4
-      // BUILD SENSOR ANALYSIS
+      // STEP 7
+      // MOTION ANALYSIS
       // ========================================================
 
-      final Map<String, dynamic>
-      motionAnalysis =
+      final motionAnalysis =
       _buildMotionAnalysis();
 
       // ========================================================
-      // STEP 5
-      // SEND RESULTS TO DJANGO
+      // STEP 8
+      // SEND TO DJANGO
       // ========================================================
 
       await _sendResultToDjango(
@@ -536,11 +670,11 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       );
 
       // ========================================================
-      // STEP 6
-      // CHECK RISK
+      // STEP 9
+      // RISK
       // ========================================================
 
-      final String riskLevel =
+      final riskLevel =
       (fastApiResult['risk_level'] ?? '')
           .toString()
           .toLowerCase()
@@ -551,13 +685,17 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       );
 
       // ========================================================
+      // DELETE VIDEO ONLY AFTER COMPLETE SUCCESS
+      // ========================================================
+
+      await _deleteLocalVideo();
+
+      // ========================================================
       // CRITICAL
       // ========================================================
 
       if (riskLevel == 'critical') {
         _scanFinished = true;
-
-        await _deleteLocalVideo();
 
         if (mounted) {
           Navigator.of(context)
@@ -571,23 +709,19 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       }
 
       // ========================================================
-      // NORMAL RESULT
+      // NORMAL
       // ========================================================
+
+      _scanFinished = true;
 
       if (mounted) {
         setState(() {
           _isProcessing = false;
-          _scanFinished = true;
         });
 
+        // Return to previous screen.
         Navigator.of(context).pop();
       }
-
-      // ========================================================
-      // DELETE LOCAL VIDEO AFTER SUCCESS
-      // ========================================================
-
-      await _deleteLocalVideo();
     } on CameraException catch (e) {
       debugPrint(
         'Camera error while finishing scan: '
@@ -599,6 +733,10 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
           _isRecording = false;
           _isProcessing = false;
         });
+
+        _showError(
+          'Camera error while saving the scan.',
+        );
       }
     } catch (e) {
       debugPrint(
@@ -612,7 +750,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         });
 
         _showError(
-          'An error occurred while processing the scan.',
+          'An error occurred while processing the safety scan.',
         );
       }
     }
@@ -648,24 +786,29 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         .millisecondsSinceEpoch
         .toString();
 
-    final String localFileName =
+    final String fileName =
         'safety_scan_$timestamp.mp4';
 
     final String localPath =
     path.join(
       scanDirectory.path,
-      localFileName,
+      fileName,
     );
 
-    // Save without loading the whole video into RAM.
-    await recordedFile.saveTo(localPath);
+    debugPrint(
+      'Copying recorded video...',
+    );
+
+    await recordedFile.saveTo(
+      localPath,
+    );
 
     final File localFile =
     File(localPath);
 
     if (!await localFile.exists()) {
       throw Exception(
-        'Local video file was not created.',
+        'Local video was not created.',
       );
     }
 
@@ -673,12 +816,13 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
     await localFile.length();
 
     debugPrint(
-      'Local video size: $fileSize bytes',
+      'Local video size: '
+          '$fileSize bytes',
     );
 
-    if (fileSize <= 0) {
+    if (fileSize < 1024) {
       throw Exception(
-        'Local video file is empty.',
+        'Video file is too small or corrupt.',
       );
     }
 
@@ -686,7 +830,48 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   }
 
   // ============================================================
-  // SEND LOCAL VIDEO TO FASTAPI
+  // VERIFY LOCAL VIDEO
+  // ============================================================
+
+  Future<bool> _verifyLocalVideo(
+      String localPath,
+      ) async {
+    try {
+      final File file =
+      File(localPath);
+
+      if (!await file.exists()) {
+        debugPrint(
+          'Video verification failed: file missing.',
+        );
+
+        return false;
+      }
+
+      final int size =
+      await file.length();
+
+      debugPrint(
+        'Video verification size: '
+            '$size bytes',
+      );
+
+      if (size < 1024) {
+        return false;
+      }
+
+      return true;
+    } catch (e) {
+      debugPrint(
+        'Video verification error: $e',
+      );
+
+      return false;
+    }
+  }
+
+  // ============================================================
+  // FASTAPI UPLOAD
   // ============================================================
 
   Future<Map<String, dynamic>?>
@@ -699,10 +884,8 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
 
       if (!await videoFile.exists()) {
         debugPrint(
-          'Local video does not exist:',
+          'Video does not exist.',
         );
-
-        debugPrint(localVideoPath);
 
         return null;
       }
@@ -711,29 +894,19 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       await videoFile.length();
 
       debugPrint(
-        'Preparing FastAPI upload...',
+        'Uploading file: '
+            '$localVideoPath',
       );
 
       debugPrint(
-        'File: $localVideoPath',
+        'Upload size: '
+            '$fileSize bytes',
       );
-
-      debugPrint(
-        'File size: $fileSize bytes',
-      );
-
-      if (fileSize <= 0) {
-        debugPrint(
-          'Video file is empty.',
-        );
-
-        return null;
-      }
 
       final Uri uri =
       Uri.parse(fastApiUrl);
 
-      final http.MultipartRequest request =
+      final request =
       http.MultipartRequest(
         'POST',
         uri,
@@ -750,45 +923,48 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       }
 
       // ========================================================
-      // IMPORTANT
+      // IMPORTANT:
       //
-      // FastAPI expects:
+      // FastAPI error previously said:
       //
-      // file: UploadFile
+      // body.file -> Field required
       //
-      // NOT:
-      //
-      // video
-      //
-      // Your 422 error was caused by this field name.
+      // Therefore the multipart field MUST be "file".
       // ========================================================
+
+      final multipartFile =
+      await http.MultipartFile.fromPath(
+        'file',
+        localVideoPath,
+        filename:
+        path.basename(localVideoPath),
+      );
 
       request.files.add(
-        await http.MultipartFile.fromPath(
-          'file',
-          localVideoPath,
-          filename:
-          path.basename(localVideoPath),
-        ),
+        multipartFile,
       );
 
       debugPrint(
-        'Multipart field name: file',
-      );
-
-      debugPrint(
-        'Sending request to FastAPI...',
+        'Sending multipart request to FastAPI...',
       );
 
       // ========================================================
-      // SEND REQUEST
+      // SEND WITH TIMEOUT
+      //
+      // Render can take a while to wake up/process the video.
       // ========================================================
 
-      final http.StreamedResponse
-      streamedResponse =
-      await request.send();
+      final streamedResponse =
+      await request.send().timeout(
+        const Duration(minutes: 5),
+        onTimeout: () {
+          throw TimeoutException(
+            'FastAPI request timed out.',
+          );
+        },
+      );
 
-      final http.Response response =
+      final response =
       await http.Response.fromStream(
         streamedResponse,
       );
@@ -804,27 +980,30 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       );
 
       // ========================================================
-      // ERROR
+      // SUCCESS
       // ========================================================
 
-      if (response.statusCode < 200 ||
-          response.statusCode >= 300) {
-        debugPrint(
-          'FastAPI error: '
-              '${response.body}',
-        );
+      if (response.statusCode >= 200 &&
+          response.statusCode < 300) {
+        dynamic decoded;
 
-        return null;
-      }
+        try {
+          decoded =
+              jsonDecode(response.body);
+        } catch (e) {
+          debugPrint(
+            'FastAPI returned invalid JSON: $e',
+          );
 
-      // ========================================================
-      // JSON
-      // ========================================================
+          return null;
+        }
 
-      final dynamic decoded =
-      jsonDecode(response.body);
+        if (decoded is Map) {
+          return Map<String, dynamic>.from(
+            decoded,
+          );
+        }
 
-      if (decoded is! Map) {
         debugPrint(
           'FastAPI response is not a JSON object.',
         );
@@ -832,18 +1011,44 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         return null;
       }
 
-      return Map<String, dynamic>.from(
-        decoded,
+      // ========================================================
+      // VALIDATION ERROR
+      // ========================================================
+
+      if (response.statusCode == 422) {
+        debugPrint(
+          'FastAPI validation error: '
+              '${response.body}',
+        );
+
+        return null;
+      }
+
+      // ========================================================
+      // SERVER ERROR
+      // ========================================================
+
+      debugPrint(
+        'FastAPI server error: '
+            '${response.statusCode}',
       );
+
+      return null;
+    } on TimeoutException catch (e) {
+      debugPrint(
+        'FastAPI timeout: $e',
+      );
+
+      return null;
     } on SocketException catch (e) {
       debugPrint(
-        'FastAPI SocketException: $e',
+        'FastAPI socket error: $e',
       );
 
       return null;
     } on http.ClientException catch (e) {
       debugPrint(
-        'FastAPI ClientException: $e',
+        'FastAPI client error: $e',
       );
 
       return null;
@@ -894,16 +1099,16 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   // ============================================================
 
   void _startSensorMonitoring() {
-    _accelerometerSubscription?.cancel();
-    _gyroscopeSubscription?.cancel();
+    _stopSensorMonitoring();
 
-    _accelerometerData.clear();
-    _gyroscopeData.clear();
+    debugPrint(
+      'Starting sensor monitoring...',
+    );
 
     _accelerometerSubscription =
         userAccelerometerEventStream().listen(
               (event) {
-            final int timestamp =
+            final timestamp =
                 DateTime.now()
                     .millisecondsSinceEpoch;
 
@@ -915,6 +1120,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
             });
 
             _detectBraking(event);
+
             _detectSwerving(event);
           },
           onError: (error) {
@@ -927,7 +1133,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
     _gyroscopeSubscription =
         gyroscopeEventStream().listen(
               (event) {
-            final int timestamp =
+            final timestamp =
                 DateTime.now()
                     .millisecondsSinceEpoch;
 
@@ -946,23 +1152,32 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         );
   }
 
+  // ============================================================
+  // STOP SENSOR MONITORING
+  // ============================================================
+
   void _stopSensorMonitoring() {
     _accelerometerSubscription?.cancel();
+
     _gyroscopeSubscription?.cancel();
 
     _accelerometerSubscription = null;
+
     _gyroscopeSubscription = null;
+
+    debugPrint(
+      'Sensor monitoring stopped.',
+    );
   }
 
   // ============================================================
-  // SUDDEN BRAKING
+  // BRAKING
   // ============================================================
 
   void _detectBraking(
       UserAccelerometerEvent event,
       ) {
-    final DateTime now =
-    DateTime.now();
+    final now = DateTime.now();
 
     if (_lastBrakingEvent != null &&
         now.difference(
@@ -991,8 +1206,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   void _detectSwerving(
       UserAccelerometerEvent event,
       ) {
-    final DateTime now =
-    DateTime.now();
+    final now = DateTime.now();
 
     if (_lastSwervingEvent != null &&
         now.difference(
@@ -1028,16 +1242,13 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
     for (final data
     in _accelerometerData) {
       final double x =
-      (data['x'] as num)
-          .toDouble();
+      (data['x'] as num).toDouble();
 
       final double y =
-      (data['y'] as num)
-          .toDouble();
+      (data['y'] as num).toDouble();
 
       final double z =
-      (data['z'] as num)
-          .toDouble();
+      (data['z'] as num).toDouble();
 
       final double magnitude =
       math.sqrt(
@@ -1070,16 +1281,13 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
     for (final data
     in _gyroscopeData) {
       final double x =
-      (data['x'] as num)
-          .toDouble();
+      (data['x'] as num).toDouble();
 
       final double y =
-      (data['y'] as num)
-          .toDouble();
+      (data['y'] as num).toDouble();
 
       final double z =
-      (data['z'] as num)
-          .toDouble();
+      (data['z'] as num).toDouble();
 
       final double magnitude =
       math.sqrt(
@@ -1132,7 +1340,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   }
 
   // ============================================================
-  // SEND RESULTS TO DJANGO
+  // DJANGO
   // ============================================================
 
   Future<void> _sendResultToDjango({
@@ -1146,10 +1354,6 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       Uri.parse(djangoUrl);
 
       final Map<String, dynamic> body = {
-        // ======================================================
-        // FASTAPI DATA
-        // ======================================================
-
         'status':
         fastApiResult['status'],
 
@@ -1184,16 +1388,8 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
         fastApiResult[
         'max_blink_duration_ms'],
 
-        // ======================================================
-        // MOTION
-        // ======================================================
-
         'motion_analysis':
         motionAnalysis,
-
-        // ======================================================
-        // TIMESTAMP
-        // ======================================================
 
         'scan_timestamp':
         DateTime.now()
@@ -1213,14 +1409,20 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
       }
 
       debugPrint(
-        'Sending analysis result to Django...',
+        'Sending safety result to Django...',
       );
 
-      final http.Response response =
-      await http.post(
+      final response =
+      await http
+          .post(
         uri,
         headers: headers,
         body: jsonEncode(body),
+      )
+          .timeout(
+        const Duration(
+          seconds: 60,
+        ),
       );
 
       debugPrint(
@@ -1240,6 +1442,10 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
               '${response.body}',
         );
       }
+    } on TimeoutException catch (e) {
+      debugPrint(
+        'Django timeout: $e',
+      );
     } catch (e) {
       debugPrint(
         'Django API error: $e',
@@ -1253,20 +1459,22 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
 
   void _resetScanData() {
     _accelerometerData.clear();
+
     _gyroscopeData.clear();
 
     _suddenBrakingEvents = 0;
+
     _swervingEvents = 0;
 
     _lastBrakingEvent = null;
+
     _lastSwervingEvent = null;
 
     _fastApiResult = null;
-    _scanFinished = false;
   }
 
   // ============================================================
-  // ERROR MESSAGE
+  // ERROR
   // ============================================================
 
   void _showError(
@@ -1285,6 +1493,8 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
           SnackBarBehavior.floating,
           backgroundColor:
           const Color(0xFFDC2626),
+          duration:
+          const Duration(seconds: 5),
         ),
       );
   }
@@ -1300,6 +1510,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
     return Scaffold(
       backgroundColor:
       const Color(0xFFF8F9FB),
+
       body: SafeArea(
         child: Column(
           children: [
@@ -1322,9 +1533,12 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
   Widget _buildHeader() {
     return Container(
       height: 62,
-      decoration: BoxDecoration(
+
+      decoration:
+      BoxDecoration(
         color:
         const Color(0xFFE5E7EB),
+
         border: Border(
           bottom: BorderSide(
             color:
@@ -1333,15 +1547,18 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
           ),
         ),
       ),
+
       padding:
       const EdgeInsets.symmetric(
         horizontal: 16,
       ),
+
       child: Row(
         children: [
           Container(
             width: 44,
             height: 44,
+
             decoration:
             const BoxDecoration(
               shape:
@@ -1349,6 +1566,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
               color:
               Color(0xFF1764C0),
             ),
+
             child: const Center(
               child: Icon(
                 Icons.navigation,
@@ -1365,7 +1583,9 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
 
           const Text(
             'VigilDrive',
-            style: TextStyle(
+
+            style:
+            TextStyle(
               fontSize: 24,
               fontWeight:
               FontWeight.w700,
@@ -1379,11 +1599,13 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
           Container(
             width: 24,
             height: 24,
+
             decoration:
             BoxDecoration(
               shape:
               BoxShape.circle,
-              border: Border.all(
+              border:
+              Border.all(
                 color:
                 const Color(
                   0xFF0062CE,
@@ -1391,6 +1613,7 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
                 width: 2,
               ),
             ),
+
             child: const Icon(
               Icons.check,
               color:
@@ -1413,159 +1636,285 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
           context,
           constraints,
           ) {
-        return SingleChildScrollView(
-          physics:
-          const NeverScrollableScrollPhysics(),
-          child: SizedBox(
-            height:
-            constraints.maxHeight,
-            child: Column(
-              children: [
-                const SizedBox(
-                  height: 20,
-                ),
+        return SizedBox(
+          height:
+          constraints.maxHeight,
 
-                // =================================================
-                // RADAR
-                // =================================================
+          child: Column(
+            children: [
+              const SizedBox(
+                height: 20,
+              ),
 
-                SizedBox(
-                  width: 300,
-                  height: 300,
-                  child: Stack(
-                    alignment:
-                    Alignment.center,
-                    children: [
-                      Container(
-                        width: 260,
-                        height: 260,
-                        decoration:
-                        BoxDecoration(
-                          shape:
-                          BoxShape.circle,
-                          border:
-                          Border.all(
-                            color:
-                            const Color(
-                              0xFFB3C6FF,
-                            ),
-                            width: 4,
+              // =================================================
+              // RADAR
+              // =================================================
+
+              SizedBox(
+                width: 300,
+                height: 300,
+
+                child: Stack(
+                  alignment:
+                  Alignment.center,
+
+                  children: [
+                    Container(
+                      width: 260,
+                      height: 260,
+
+                      decoration:
+                      BoxDecoration(
+                        shape:
+                        BoxShape.circle,
+                        border:
+                        Border.all(
+                          color:
+                          const Color(
+                            0xFFB3C6FF,
                           ),
+                          width: 4,
                         ),
                       ),
+                    ),
 
-                      Container(
-                        width: 230,
-                        height: 230,
-                        decoration:
-                        BoxDecoration(
-                          shape:
-                          BoxShape.circle,
-                          border:
-                          Border.all(
-                            color:
-                            const Color(
-                              0xFFD5DEFF,
-                            ),
-                            width: 2,
+                    Container(
+                      width: 230,
+                      height: 230,
+
+                      decoration:
+                      BoxDecoration(
+                        shape:
+                        BoxShape.circle,
+                        border:
+                        Border.all(
+                          color:
+                          const Color(
+                            0xFFD5DEFF,
                           ),
+                          width: 2,
                         ),
                       ),
+                    ),
 
-                      Container(
-                        width: 180,
-                        height: 180,
-                        decoration:
-                        BoxDecoration(
-                          shape:
-                          BoxShape.circle,
-                          border:
-                          Border.all(
-                            color:
-                            const Color(
-                              0xFF1764C0,
-                            ),
-                            width: 1.2,
+                    Container(
+                      width: 180,
+                      height: 180,
+
+                      decoration:
+                      BoxDecoration(
+                        shape:
+                        BoxShape.circle,
+                        border:
+                        Border.all(
+                          color:
+                          const Color(
+                            0xFF1764C0,
                           ),
+                          width: 1.2,
                         ),
                       ),
+                    ),
 
-                      Positioned(
-                        left: 55,
-                        right: 55,
-                        child:
-                        Container(
-                          height: 5,
-                          decoration:
-                          BoxDecoration(
-                            gradient:
-                            const LinearGradient(
-                              colors: [
-                                Color(
-                                  0x003B82F6,
-                                ),
-                                Color(
-                                  0xFF1764C0,
-                                ),
-                                Color(
-                                  0x003B82F6,
-                                ),
-                              ],
-                            ),
-                            boxShadow: [
-                              BoxShadow(
-                                color:
-                                const Color(
-                                  0xFF1764C0,
-                                ).withOpacity(
-                                  0.45,
-                                ),
-                                blurRadius:
-                                8,
-                                spreadRadius:
-                                2,
+                    Positioned(
+                      left: 55,
+                      right: 55,
+
+                      child:
+                      Container(
+                        height: 5,
+
+                        decoration:
+                        BoxDecoration(
+                          gradient:
+                          const LinearGradient(
+                            colors: [
+                              Color(
+                                0x003B82F6,
+                              ),
+                              Color(
+                                0xFF1764C0,
+                              ),
+                              Color(
+                                0x003B82F6,
                               ),
                             ],
                           ),
+
+                          boxShadow: [
+                            BoxShadow(
+                              color:
+                              const Color(
+                                0xFF1764C0,
+                              ).withOpacity(
+                                0.45,
+                              ),
+                              blurRadius:
+                              8,
+                              spreadRadius:
+                              2,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                    Container(
+                      width: 50,
+                      height: 50,
+
+                      decoration:
+                      BoxDecoration(
+                        shape:
+                        BoxShape.circle,
+                        border:
+                        Border.all(
+                          color:
+                          const Color(
+                            0xFF3477D1,
+                          ),
+                          width: 5,
                         ),
                       ),
 
+                      child:
                       Container(
-                        width: 50,
-                        height: 50,
+                        margin:
+                        const EdgeInsets
+                            .all(6),
+
                         decoration:
-                        BoxDecoration(
+                        const BoxDecoration(
                           shape:
                           BoxShape.circle,
-                          border:
-                          Border.all(
-                            color:
-                            const Color(
-                              0xFF3477D1,
-                            ),
-                            width: 5,
+                          color:
+                          Color(
+                            0xFF3477D1,
                           ),
                         ),
+
                         child:
-                        Container(
-                          margin:
-                          const EdgeInsets
-                              .all(6),
-                          decoration:
-                          const BoxDecoration(
-                            shape:
-                            BoxShape.circle,
-                            color:
-                            Color(
-                              0xFF3477D1,
-                            ),
-                          ),
-                          child:
-                          const Icon(
-                            Icons.radar,
-                            color:
-                            Colors.white,
-                            size: 24,
+                        const Icon(
+                          Icons.radar,
+                          color:
+                          Colors.white,
+                          size: 24,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              // =================================================
+              // TITLE
+              // =================================================
+
+              const Text(
+                'Safety Scan in Progress',
+
+                textAlign:
+                TextAlign.center,
+
+                style:
+                TextStyle(
+                  fontSize: 17,
+                  fontWeight:
+                  FontWeight.w500,
+                  color:
+                  Color(0xFF222222),
+                ),
+              ),
+
+              const SizedBox(
+                height: 12,
+              ),
+
+              Padding(
+                padding:
+                const EdgeInsets
+                    .symmetric(
+                  horizontal: 28,
+                ),
+
+                child: Text(
+                  _isProcessing
+                      ? 'Analyzing your safety scan...'
+                      : 'Please remain attentive and keep your eyes\n'
+                      'on the road.',
+
+                  textAlign:
+                  TextAlign.center,
+
+                  style:
+                  const TextStyle(
+                    fontSize: 17,
+                    height: 1.4,
+                    color:
+                    Color(0xFF555967),
+                  ),
+                ),
+              ),
+
+              const SizedBox(
+                height: 18,
+              ),
+
+              // =================================================
+              // COUNTDOWN
+              // =================================================
+
+              if (_isRecording)
+                Text(
+                  'Recording: '
+                      '$_remainingSeconds s',
+
+                  style:
+                  const TextStyle(
+                    fontSize: 14,
+                    fontWeight:
+                    FontWeight.w600,
+                    color:
+                    Color(0xFF2563EB),
+                  ),
+                ),
+
+              // =================================================
+              // PROCESSING
+              // =================================================
+
+              if (_isProcessing)
+                const Padding(
+                  padding:
+                  EdgeInsets.only(
+                    top: 16,
+                  ),
+
+                  child:
+                  Column(
+                    children: [
+                      SizedBox(
+                        width: 25,
+                        height: 25,
+
+                        child:
+                        CircularProgressIndicator(
+                          strokeWidth: 2.5,
+                        ),
+                      ),
+
+                      SizedBox(
+                        height: 10,
+                      ),
+
+                      Text(
+                        'Uploading and analyzing...',
+                        style:
+                        TextStyle(
+                          fontSize: 13,
+                          color:
+                          Color(
+                            0xFF555967,
                           ),
                         ),
                       ),
@@ -1573,140 +1922,27 @@ class _SafetyScanScreenState extends State<SafetyScanScreen>
                   ),
                 ),
 
-                // =================================================
-                // TITLE
-                // =================================================
+              // =================================================
+              // CAMERA PREVIEW
+              //
+              // Keep it effectively invisible as in your
+              // original design.
+              // =================================================
 
-                Text(
-                  _isProcessing
-                      ? 'Processing Safety Scan'
-                      : 'Safety Scan in Progress',
-                  textAlign:
-                  TextAlign.center,
-                  style:
-                  const TextStyle(
-                    fontSize: 17,
-                    fontWeight:
-                    FontWeight.w500,
-                    color:
-                    Color(0xFF222222),
+              if (_cameraReady &&
+                  _cameraController !=
+                      null &&
+                  !_isProcessing)
+                SizedBox(
+                  width: 1,
+                  height: 1,
+
+                  child:
+                  CameraPreview(
+                    _cameraController!,
                   ),
                 ),
-
-                const SizedBox(
-                  height: 12,
-                ),
-
-                // =================================================
-                // DESCRIPTION
-                // =================================================
-
-                Padding(
-                  padding:
-                  const EdgeInsets
-                      .symmetric(
-                    horizontal: 28,
-                  ),
-                  child: Text(
-                    _isProcessing
-                        ? 'Uploading and analyzing your safety scan...'
-                        : 'Please remain attentive and keep your eyes\n'
-                        'on the road.',
-                    textAlign:
-                    TextAlign.center,
-                    style:
-                    const TextStyle(
-                      fontSize: 17,
-                      height: 1.4,
-                      color:
-                      Color(0xFF555967),
-                    ),
-                  ),
-                ),
-
-                const SizedBox(
-                  height: 18,
-                ),
-
-                // =================================================
-                // HIDDEN CAMERA PREVIEW
-                // =================================================
-
-                if (_cameraReady &&
-                    _cameraController !=
-                        null)
-                  SizedBox(
-                    width: 1,
-                    height: 1,
-                    child:
-                    CameraPreview(
-                      _cameraController!,
-                    ),
-                  ),
-
-                // =================================================
-                // RECORDING COUNTDOWN
-                // =================================================
-
-                if (_isRecording)
-                  Text(
-                    'Recording: '
-                        '$_remainingSeconds s',
-                    style:
-                    const TextStyle(
-                      fontSize: 13,
-                      fontWeight:
-                      FontWeight.w600,
-                      color:
-                      Color(0xFF2563EB),
-                    ),
-                  ),
-
-                // =================================================
-                // PROCESSING
-                // =================================================
-
-                if (_isProcessing)
-                  const Padding(
-                    padding:
-                    EdgeInsets.only(
-                      top: 14,
-                    ),
-                    child:
-                    SizedBox(
-                      width: 22,
-                      height: 22,
-                      child:
-                      CircularProgressIndicator(
-                        strokeWidth: 2.5,
-                      ),
-                    ),
-                  ),
-
-                // =================================================
-                // CAMERA RETRY
-                // =================================================
-
-                if (!_cameraReady &&
-                    !_isProcessing)
-                  Padding(
-                    padding:
-                    const EdgeInsets
-                        .only(
-                      top: 18,
-                    ),
-                    child:
-                    ElevatedButton(
-                      onPressed:
-                      _initializeCamera,
-                      child:
-                      const Text(
-                        'RETRY CAMERA',
-                      ),
-                    ),
-                  ),
-              ],
-            ),
+            ],
           ),
         );
       },
